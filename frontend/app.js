@@ -3,7 +3,14 @@ const money = cents => `$${(cents / 100).toFixed(2)}`;
 const api = (path, options) => fetch(path, { headers: { 'content-type': 'application/json' }, ...options }).then(async response => { const data = response.status === 204 ? null : await response.json(); if (!response.ok) throw new Error(data.error); return data; });
 let products = []; let cart = [];
 const renderCount = () => { document.querySelector('#cart-count').textContent = cart.reduce((sum, item) => sum + item.quantity, 0); };
-const loadCart = () => api(`/api/cart?userId=${userId}`).then(items => { cart = items; renderCart(); });
+const loadCart = () => api(`/api/cart?userId=${userId}`).then(items => { cart = items; renderCart(); }).catch(error => {
+  console.error('Failed to load cart', error);
+  cart = [];
+  renderCart();
+  const target = document.querySelector('#cart-items');
+  if (target) target.innerHTML = '<p class="muted">Unable to load your cart right now. Please try again.</p>';
+  return [];
+});
 const renderCart = () => { renderCount(); const target = document.querySelector('#cart-items'); if (!target) return; target.innerHTML = cart.length ? cart.map(item => `<div class="cart-item"><span>${item.product.emoji} ${item.product.name} × ${item.quantity}</span><b>${money(item.product.priceCents * item.quantity)}</b></div>`).join('') : '<p class="muted">Your cart is empty.</p>'; const total = cart.reduce((sum, item) => sum + item.product.priceCents * item.quantity, 0); const totalElement = document.querySelector('#cart-total'); if (totalElement) totalElement.textContent = money(total); };
 const add = id => api(`/api/cart?userId=${userId}`, { method: 'POST', body: JSON.stringify({ productId: id, quantity: 1 }) }).then(items => { cart = items; renderCart(); });
 const shopPage = () => { document.querySelector('#app').innerHTML = `<section class="intro"><p class="eyebrow">Workshop commerce lab</p><h1>Useful things for<br><em>curious work.</em></h1><p>A tiny, editable ecommerce experience with a PostgreSQL catalog, persistent cart, checkout, and payment service.</p></section><section><div class="section-heading"><h2>Shop the field notes</h2><span id="status">Loading...</span></div><div id="products" class="product-grid"></div></section>`; api('/api/products').then(items => { products = items; document.querySelector('#status').textContent = `${items.length} items`; document.querySelector('#products').innerHTML = items.map(product => `<article class="product"><div class="product-art">${product.emoji}</div><p class="category">${product.category}</p><h3>${product.name}</h3><p>${product.description}</p><div class="product-foot"><strong>${money(product.priceCents)}</strong><button data-id="${product.id}">Add to cart</button></div></article>`).join(''); document.querySelectorAll('[data-id]').forEach(button => button.onclick = () => add(button.dataset.id)); }).catch(error => document.querySelector('#status').textContent = error.message); };
