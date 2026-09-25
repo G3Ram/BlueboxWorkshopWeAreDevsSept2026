@@ -6,35 +6,78 @@ const { randomUUID } = require('node:crypto');
 const port = Number(process.env.PORT || 8088);
 const paymentUrl = process.env.PAYMENT_URL || 'http://localhost:4004';
 const postgrestUrl = process.env.POSTGREST_URL || 'http://localhost:3000';
-const databasePool = [{}, {}];
+const getSalePrice = product => {
+  if (!product) return 0;
+  const originalPrice = Number(product.priceCents ?? product.price_cents ?? 0);
+  if (!(product.onSale ?? product.on_sale)) return originalPrice;
+  const salePrice = Number(product.salePriceCents ?? product.sale_price_cents ?? Math.round(originalPrice * 0.8));
+  return Number.isFinite(salePrice) ? salePrice : originalPrice;
+};
 const products = [
-  { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕' },
-  { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓' },
-  { id: 'orbit-lamp', name: 'Orbit Desk Lamp', description: 'A warm, adjustable glow for focused work.', priceCents: 6400, category: 'Studio', emoji: '💡' },
-  { id: 'cloud-socks', name: 'Cloudline Socks', description: 'Soft merino socks for long pairing sessions.', priceCents: 1600, category: 'Wear', emoji: '🧦' },
-  { id: 'field-bag', name: 'Field Notes Bag', description: 'A compact canvas carry for your everyday kit.', priceCents: 5200, category: 'Carry', emoji: '👜' },
-  { id: 'night-hoodie', name: 'Night Shift Hoodie', description: 'A heavyweight layer for cool offices and warmer thinking.', priceCents: 7200, category: 'Wear', emoji: '🧥' },
+  { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕', onSale: false },
+  { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓', onSale: true, salePriceCents: 1440, saleLabel: 'Flash Sale' },
+  { id: 'orbit-lamp', name: 'Orbit Desk Lamp', description: 'A warm, adjustable glow for focused work.', priceCents: 6400, category: 'Studio', emoji: '💡', onSale: false },
+  { id: 'cloud-socks', name: 'Cloudline Socks', description: 'Soft merino socks for long pairing sessions.', priceCents: 1600, category: 'Wear', emoji: '🧦', onSale: false },
+  { id: 'field-bag', name: 'Field Notes Bag', description: 'A compact canvas carry for your everyday kit.', priceCents: 5200, category: 'Carry', emoji: '👜', onSale: false },
+  { id: 'night-hoodie', name: 'Night Shift Hoodie', description: 'A heavyweight layer for cool offices and warmer thinking.', priceCents: 7200, category: 'Wear', emoji: '🧥', onSale: true, salePriceCents: 5760, saleLabel: 'Flash Sale' },
 ];
 
 const send = (res, status, value, type = 'application/json') => { res.writeHead(status, { 'content-type': type }); res.end(type === 'application/json' ? JSON.stringify(value) : value); };
 const readBody = req => new Promise((resolve, reject) => { let value = ''; req.on('data', chunk => { value += chunk; }); req.on('end', () => resolve(value ? JSON.parse(value) : {})); req.on('error', reject); });
-const database = async (url, options = {}) => {
-  const connection = databasePool.pop();
-  if (!connection) {
-    console.error(JSON.stringify({ event: 'database_pool_exhausted', poolSize: 2, databaseUrl: url }));
-    throw new Error('database connection pool exhausted');
-  }
-  try {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    const response = await fetch(`${postgrestUrl}${url}`, { ...options, headers: { accept: 'application/json', 'content-type': 'application/json', ...(options.headers || {}) } });
-    const text = await response.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
-    if (!response.ok) throw new Error(data?.message || data?.details || `Database request failed: ${response.status}`);
-    return data;
-  } finally {
-    databasePool.push(connection);
-  }
+const mapProduct = product => {
+  const catalogProduct = products.find(entry => entry.id === product?.id) || {};
+  const merged = { ...catalogProduct, ...product };
+  const priceCents = Number(merged.price_cents ?? merged.priceCents ?? 0);
+  const onSale = Boolean(merged.on_sale ?? merged.onSale ?? false);
+  const salePriceCents = Number(merged.sale_price_cents ?? merged.salePriceCents ?? (onSale ? Math.round(priceCents * 0.8) : 0));
+  return {
+    ...merged,
+    id: merged.id,
+    name: merged.name,
+    description: merged.description,
+    priceCents,
+    category: merged.category,
+    emoji: merged.emoji,
+    onSale,
+    salePriceCents: onSale ? salePriceCents : undefined,
+    saleLabel: merged.sale_label ?? merged.saleLabel ?? (onSale ? 'Flash Sale' : undefined),
+  };
 };
-const mapProduct = product => ({ ...product, priceCents: product.price_cents, price_cents: undefined });
+const createDatabase = ({ fetchImpl = fetch, maxConnections = 2, delayMs = Number(process.env.DATABASE_DELAY_MS || 0), postgrestBaseUrl = postgrestUrl } = {}) => {
+  let activeConnections = 0;
+  const waitQueue = [];
+
+  const acquireConnection = () => {
+    if (activeConnections < maxConnections) {
+      activeConnections += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => { waitQueue.push(resolve); });
+  };
+
+  const releaseConnection = () => {
+    activeConnections -= 1;
+    const nextResolver = waitQueue.shift();
+    if (nextResolver) {
+      activeConnections += 1;
+      nextResolver();
+    }
+  };
+
+  return async (url, options = {}) => {
+    await acquireConnection();
+    try {
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+      const response = await fetchImpl(`${postgrestBaseUrl}${url}`, { ...options, headers: { accept: 'application/json', 'content-type': 'application/json', ...(options.headers || {}) } });
+      const text = await response.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
+      if (!response.ok) throw new Error(data?.message || data?.details || `Database request failed: ${response.status}`);
+      return data;
+    } finally {
+      releaseConnection();
+    }
+  };
+};
+const database = createDatabase();
 const cart = userId => database(`/carts?user_id=eq.${encodeURIComponent(userId)}&select=quantity,products(*)`).then(items => items.map(item => ({ product: mapProduct(item.products), quantity: item.quantity })));
 
 async function route(req, res, url) {
@@ -51,7 +94,7 @@ async function route(req, res, url) {
   if (url.pathname === '/api/cart' && req.method === 'DELETE') { await database(`/carts?user_id=eq.${encodeURIComponent(userId)}`, { method: 'DELETE' }); return send(res, 204, null); }
   if (url.pathname === '/api/checkout' && req.method === 'POST') {
     const input = await readBody(req); const items = await cart(userId); if (!items.length) return send(res, 400, { error: 'Your cart is empty' });
-    const totalCents = items.reduce((total, item) => total + item.product.priceCents * item.quantity, 0);
+    const totalCents = items.reduce((total, item) => total + getSalePrice(item.product) * item.quantity, 0);
     const orderId = `order_${randomUUID().slice(0, 8)}`;
     const charge = attempt => {
       const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 150);
@@ -71,4 +114,8 @@ async function route(req, res, url) {
   if (url.pathname === '/styles.css') return send(res, 200, fs.readFileSync(path.join(__dirname, 'frontend/styles.css'), 'utf8'), 'text/css');
   return send(res, 404, { error: 'Not found' });
 }
-http.createServer((req, res) => route(req, res, new URL(req.url, `http://${req.headers.host}`)).catch(error => { console.error(error); send(res, 500, { error: error.message }); })).listen(port, () => console.log(`shop API and frontend running at http://localhost:${port}`));
+if (require.main === module) {
+  http.createServer((req, res) => route(req, res, new URL(req.url, `http://${req.headers.host}`)).catch(error => { console.error(error); send(res, 500, { error: error.message }); })).listen(port, () => console.log(`shop API and frontend running at http://localhost:${port}`));
+}
+
+module.exports = { createDatabase, route, products, getSalePrice };
